@@ -1,7 +1,6 @@
 import streamlit as st
 import xml.etree.ElementTree as ET
 import pandas as pd
-from datetime import datetime
 from io import BytesIO
 import requests
 
@@ -31,8 +30,6 @@ def parse_alectra_xml(uploaded_file):
 
     df = pd.DataFrame(records)
     df["load_kWh"] = df["load_Wh"] / 1000.0
-    # 额外转成人类可读的 Toronto 时间（仅展示用）
-    df["time"] = pd.to_datetime(df["epoch"], unit="s", utc=True).dt.tz_convert("America/Toronto")
     return df
 
 
@@ -60,7 +57,6 @@ def hourly_solar_data_multi_year(lat, lon, start_year, end_year,
     poa = data["poa"]  # W/m²
     ac = data["ac"]    # kWh
 
-    # 生成 Toronto 本地时间
     base_df = pd.DataFrame({
         "time": pd.date_range("2001-01-01", periods=8760, freq="H", tz="America/Toronto"),
         "poa_Wm2": poa,
@@ -71,17 +67,17 @@ def hourly_solar_data_multi_year(lat, lon, start_year, end_year,
     for year in range(start_year, end_year + 1):
         df_year = base_df.copy()
         df_year["time"] = df_year["time"].apply(lambda d: d.replace(year=year))
-        # ✅ 转 epoch (UTC 秒)
+        # 转 epoch
         df_year["epoch"] = df_year["time"].astype("int64") // 10**9
         df_year["year"] = year
         df_year["system_capacity_kw"] = system_capacity_kw
-        all_years.append(df_year[["epoch", "time", "year", "poa_Wm2", "ac_kWh", "system_capacity_kw"]])
+        all_years.append(df_year[["epoch", "year", "poa_Wm2", "ac_kWh", "system_capacity_kw"]])
 
     return pd.concat(all_years, ignore_index=True)
 
 
 # ---------------- Streamlit UI ----------------
-st.title("⚡ Load vs PV Generation (Epoch Alignment)")
+st.title("⚡ Load + PV Data Merger (Epoch Alignment)")
 
 uploaded_file = st.file_uploader("Upload Alectra Green Button XML file", type=["xml"])
 
@@ -96,9 +92,9 @@ with st.sidebar:
 
 API_KEY = "NiW6JjfVhrZdFMiNwsQfNVuEveL67iy2Jmq9Gopz"
 
-if uploaded_file and st.button("Run Analysis"):
+if uploaded_file and st.button("Generate File"):
     try:
-        # Parse Green Button load
+        # Parse load
         load_df = parse_alectra_xml(uploaded_file)
 
         # Parse year range
@@ -107,30 +103,16 @@ if uploaded_file and st.button("Run Analysis"):
         else:
             start_year = end_year = int(year_range)
 
-        # PV Data
+        # Get PV
         pv_df = hourly_solar_data_multi_year(lat, lon, start_year, end_year,
                                              system_capacity_kw=system_capacity_kw,
                                              tilt=tilt, azimuth=azimuth,
                                              api_key=API_KEY)
 
-        # 合并用 epoch 对齐
+        # Merge by epoch
         merged = pd.merge(load_df, pv_df, on="epoch", how="inner")
 
-        st.success("✅ Data merged successfully!")
-
-        st.subheader("📊 Preview")
-        st.dataframe(merged.head(50))
-
-        # Plot load vs PV
-        st.subheader("📈 Load vs PV Generation")
-        st.line_chart(merged.set_index("time")[["load_kWh", "ac_kWh"]])
-
-        # Annual totals
-        st.subheader("📊 Annual Totals")
-        annual = merged.groupby("year")[["load_kWh", "ac_kWh"]].sum().reset_index()
-        st.dataframe(annual)
-
-        # Download merged data
+        # Export file
         output = BytesIO()
         merged.to_csv(output, index=False)
         st.download_button(
@@ -139,6 +121,8 @@ if uploaded_file and st.button("Run Analysis"):
             file_name="load_vs_pv.csv",
             mime="text/csv"
         )
+
+        st.success("✅ File generated successfully!")
 
     except Exception as e:
         st.error(f"Error: {e}")
