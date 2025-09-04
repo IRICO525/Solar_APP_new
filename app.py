@@ -53,14 +53,14 @@ def hourly_solar_data_multi_year(lat, lon, start_year, end_year,
 
 # ----------------- Streamlit UI -----------------
 
-st.title("☀️ Solar Irradiance & PV Production")
+st.title("☀️ Solar Irradiance & PV Production (Multi-Capacity Comparison)")
 
 with st.sidebar:
     st.header("⚙️ Input parameters")
     lat = st.number_input("Latitude:", value=43.653, format="%.6f")
     lon = st.number_input("Longitude:", value=-79.383, format="%.6f")
     year_range = st.text_input("Enter year range (e.g. 2023-2025):", "2023-2025")
-    capacities_input = st.text_input("System capacities (kW, comma separated):", "100,200")
+    capacities_input = st.text_input("System capacities (kW, comma separated):", "100,200,500")
     tilt = st.slider("Panel tilt (°)", 0, 90, 35)
     azimuth = st.slider("Panel azimuth (°)", 0, 360, 180)
 
@@ -92,26 +92,39 @@ if st.button("Generate Data"):
         st.subheader("📊 Preview (first 50 rows)")
         st.dataframe(df_all.head(50))
 
-        # Annual totals
+        # ===================== Annual totals =====================
         st.subheader("📈 Annual totals (kWh)")
         annual_totals = df_all.groupby(["year", "system_capacity_kw"])["ac_kWh"].sum().reset_index()
-        st.line_chart(annual_totals.pivot(index="year", columns="system_capacity_kw", values="ac_kWh"))
-        st.table(annual_totals)
 
-        # Monthly profile
+        # 折线图
+        st.line_chart(annual_totals.pivot(index="year", columns="system_capacity_kw", values="ac_kWh"))
+
+        # 横向对比表格
+        annual_pivot = annual_totals.pivot(index="year", columns="system_capacity_kw", values="ac_kWh")
+        st.subheader("📊 Annual totals (Horizontal Comparison)")
+        st.dataframe(annual_pivot)
+
+        # ===================== Monthly profile =====================
         st.subheader("📆 Monthly average profile")
         df_all["month"] = df_all["time"].dt.month
         monthly = df_all.groupby(["month", "system_capacity_kw"])["ac_kWh"].mean().reset_index()
+
+        # 折线图
         st.line_chart(monthly.pivot(index="month", columns="system_capacity_kw", values="ac_kWh"))
 
-        # Typical day (summer solstice)
+        # 横向对比表格
+        monthly_pivot = monthly.pivot(index="month", columns="system_capacity_kw", values="ac_kWh")
+        st.subheader("📊 Monthly averages (Horizontal Comparison)")
+        st.dataframe(monthly_pivot)
+
+        # ===================== Typical day =====================
         st.subheader("🌞 Typical day profile (June 21)")
         typical_day = df_all[df_all["time"].dt.strftime("%m-%d") == "06-21"].copy()
         typical_day["hour_of_day"] = typical_day["time"].dt.hour
         day_avg = typical_day.groupby(["hour_of_day", "system_capacity_kw"])["ac_kWh"].mean().reset_index()
         st.line_chart(day_avg.pivot(index="hour_of_day", columns="system_capacity_kw", values="ac_kWh"))
 
-        # Download
+        # ===================== Download =====================
         output = BytesIO()
         df_all.to_csv(output, index=False)
         st.download_button(
