@@ -1,14 +1,51 @@
 import streamlit as st
-import requests
+import xml.etree.ElementTree as ET
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
+import requests
+import pytz
 
 
+# ---------------- Green Button XML Parser ----------------
+def parse_alectra_xml(uploaded_file):
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "espi": "http://naesb.org/espi"
+    }
+    uploaded_file.seek(0)
+    tree = ET.parse(uploaded_file)
+    root = tree.getroot()
+
+    records = []
+    for block in root.findall(".//atom:entry/atom:content/espi:IntervalBlock", ns):
+        for reading in block.findall("espi:IntervalReading", ns):
+            start = reading.find("espi:timePeriod/espi:start", ns).text
+            duration = reading.find("espi:timePeriod/espi:duration", ns).text
+            value = reading.find("espi:value", ns).text
+
+            # Convert epoch → datetime UTC
+            ts_utc = pd.to_datetime(int(start), unit="s", utc=True)
+
+            records.append({
+                "time": ts_utc,
+                "duration_sec": int(duration),
+                "load_Wh": float(value)
+            })
+
+    df = pd.DataFrame(records)
+    df["load_kWh"] = df["load_Wh"] / 1000.0
+
+    # Convert to Toronto local time
+    df["time"] = df["time"].dt.tz_convert("America/Toronto")
+
+    return df
+
+
+# ---------------- PVWatts API ----------------
 def hourly_solar_data_multi_year(lat, lon, start_year, end_year,
                                  system_capacity_kw=1, tilt=35, azimuth=180,
                                  losses=14, api_key="YOUR_API_KEY"):
-    """Get hourly solar irradiance for multiple years (using TMY repeated)."""
     url = "https://developer.nrel.gov/api/pvwatts/v6.json"
     params = {
         "api_key": api_key,
@@ -29,11 +66,9 @@ def hourly_solar_data_multi_year(lat, lon, start_year, end_year,
     poa = data["poa"]  # W/m²
     ac = data["ac"]    # kWh
 
-    # Base year (dummy TMY year)
     base_df = pd.DataFrame({
         "hour": pd.date_range("2001-01-01", periods=8760, freq="H"),
         "poa_Wm2": poa,
-        "poa_kWhm2": [x / 1000.0 for x in poa],
         "ac_kWh": ac
     })
 
@@ -41,96 +76,76 @@ def hourly_solar_data_multi_year(lat, lon, start_year, end_year,
     for year in range(start_year, end_year + 1):
         df_year = base_df.copy()
         df_year["time"] = df_year["hour"].apply(lambda d: d.replace(year=year))
-        df_year["epoch"] = df_year["time"].apply(lambda d: int(datetime.timestamp(d)))
+        df_year["time"] = pd.to_datetime(df_year["time"]).dt.tz_localize("America/Toronto")
         df_year["year"] = year
         df_year["system_capacity_kw"] = system_capacity_kw
-        all_years.append(df_year[["epoch", "time", "year", "poa_Wm2",
-                                  "poa_kWhm2", "ac_kWh", "system_capacity_kw"]])
+        all_years.append(df_year[["time", "year", "poa_Wm2", "ac_kWh", "system_capacity_kw"]])
 
-    final_df = pd.concat(all_years, ignore_index=True)
-    return final_df
+    return pd.concat(all_years, ignore_index=True)
 
 
-# ----------------- Streamlit UI -----------------
+# ---------------- Streamlit UI ----------------
+st.title("⚡ Load vs PV Generation (Green Button + PVWatts)")
 
-st.title("☀️ Solar Irradiance & PV Production (Multi-Capacity Comparison)")
+# Upload load data
+uploaded_file = st.file_uploader("Upload Alectra Green Button XML file", type=["xml"])
 
 with st.sidebar:
-    st.header("⚙️ Input parameters")
+    st.header("PV System Parameters")
     lat = st.number_input("Latitude:", value=43.653, format="%.6f")
     lon = st.number_input("Longitude:", value=-79.383, format="%.6f")
-    year_range = st.text_input("Enter year range (e.g. 2023-2025):", "2023-2025")
-    capacities_input = st.text_input("System capacities (kW, comma separated):", "100,200,500")
+    year_range = st.text_input("Enter year range (e.g. 2023-2024):", "2023-2023")
+    system_capacity_kw = st.number_input("System capacity (kW):", min_value=1.0, value=100.0, step=10.0)
     tilt = st.slider("Panel tilt (°)", 0, 90, 35)
     azimuth = st.slider("Panel azimuth (°)", 0, 360, 180)
 
 API_KEY = "NiW6JjfVhrZdFMiNwsQfNVuEveL67iy2Jmq9Gopz"
 
-if st.button("Generate Data"):
+
+if uploaded_file and st.button("Run Analysis"):
     try:
+        # Parse Green Button load
+        load_df = parse_alectra_xml(uploaded_file)
+
+        # Parse year range
         if "-" in year_range:
             start_year, end_year = map(int, year_range.split("-"))
         else:
             start_year = end_year = int(year_range)
 
-        # Parse system capacities
-        capacities = [float(c.strip()) for c in capacities_input.split(",") if c.strip()]
+        # PV Data
+        pv_df = hourly_solar_data_multi_year(lat, lon, start_year, end_year,
+                                             system_capacity_kw=system_capacity_kw,
+                                             tilt=tilt, azimuth=azimuth,
+                                             api_key=API_KEY)
 
-        dfs = []
-        for cap in capacities:
-            df_cap = hourly_solar_data_multi_year(lat, lon, start_year, end_year,
-                                                  system_capacity_kw=cap,
-                                                  tilt=tilt, azimuth=azimuth,
-                                                  api_key=API_KEY)
-            dfs.append(df_cap)
+        # Resample PV data to 5 min
+        pv_df = pv_df.set_index("time").resample("5T").ffill().reset_index()
 
-        df_all = pd.concat(dfs, ignore_index=True)
+        # Merge
+        merged = pd.merge(load_df, pv_df, on="time", how="inner")
 
-        st.success(f"✅ Data generated for {lat:.4f}, {lon:.4f} ({start_year}-{end_year}), "
-                   f"tilt {tilt}°, azimuth {azimuth}° with capacities {capacities} kW.")
+        st.success("✅ Data merged successfully!")
 
-        st.subheader("📊 Preview (first 50 rows)")
-        st.dataframe(df_all.head(50))
+        st.subheader("📊 Preview")
+        st.dataframe(merged.head(50))
 
-        # ===================== Annual totals =====================
-        st.subheader("📈 Annual totals (kWh)")
-        annual_totals = df_all.groupby(["year", "system_capacity_kw"])["ac_kWh"].sum().reset_index()
+        # Plot load vs PV
+        st.subheader("📈 Load vs PV Generation")
+        st.line_chart(merged.set_index("time")[["load_kWh", "ac_kWh"]])
 
-        # 折线图
-        st.line_chart(annual_totals.pivot(index="year", columns="system_capacity_kw", values="ac_kWh"))
+        # Annual totals
+        st.subheader("📊 Annual Totals")
+        annual = merged.groupby("year")[["load_kWh", "ac_kWh"]].sum().reset_index()
+        st.dataframe(annual)
 
-        # 横向对比表格
-        annual_pivot = annual_totals.pivot(index="year", columns="system_capacity_kw", values="ac_kWh")
-        st.subheader("📊 Annual totals (Horizontal Comparison)")
-        st.dataframe(annual_pivot)
-
-        # ===================== Monthly profile =====================
-        st.subheader("📆 Monthly average profile")
-        df_all["month"] = df_all["time"].dt.month
-        monthly = df_all.groupby(["month", "system_capacity_kw"])["ac_kWh"].mean().reset_index()
-
-        # 折线图
-        st.line_chart(monthly.pivot(index="month", columns="system_capacity_kw", values="ac_kWh"))
-
-        # 横向对比表格
-        monthly_pivot = monthly.pivot(index="month", columns="system_capacity_kw", values="ac_kWh")
-        st.subheader("📊 Monthly averages (Horizontal Comparison)")
-        st.dataframe(monthly_pivot)
-
-        # ===================== Typical day =====================
-        st.subheader("🌞 Typical day profile (June 21)")
-        typical_day = df_all[df_all["time"].dt.strftime("%m-%d") == "06-21"].copy()
-        typical_day["hour_of_day"] = typical_day["time"].dt.hour
-        day_avg = typical_day.groupby(["hour_of_day", "system_capacity_kw"])["ac_kWh"].mean().reset_index()
-        st.line_chart(day_avg.pivot(index="hour_of_day", columns="system_capacity_kw", values="ac_kWh"))
-
-        # ===================== Download =====================
+        # Download merged data
         output = BytesIO()
-        df_all.to_csv(output, index=False)
+        merged.to_csv(output, index=False)
         st.download_button(
-            label="⬇️ Download full CSV",
+            label="⬇️ Download merged CSV",
             data=output.getvalue(),
-            file_name=f"solar_hourly_{start_year}_{end_year}.csv",
+            file_name="load_vs_pv.csv",
             mime="text/csv"
         )
 
