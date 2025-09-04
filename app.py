@@ -4,7 +4,6 @@ import pandas as pd
 from datetime import datetime, timezone
 from io import BytesIO
 import requests
-import pytz
 
 
 # ---------------- Green Button XML Parser ----------------
@@ -66,19 +65,21 @@ def hourly_solar_data_multi_year(lat, lon, start_year, end_year,
     poa = data["poa"]  # W/m²
     ac = data["ac"]    # kWh
 
-base_df = pd.DataFrame({
-    "hour": pd.date_range("2001-01-01", periods=8760, freq="H", tz="America/Toronto"),
-    "poa_Wm2": poa,
-    "ac_kWh": ac
-})
+    # ✅ 加入 tz 参数，避免夏令时报错
+    base_df = pd.DataFrame({
+        "hour": pd.date_range("2001-01-01", periods=8760, freq="H", tz="America/Toronto"),
+        "poa_Wm2": poa,
+        "ac_kWh": ac
+    })
 
-all_years = []
-for year in range(start_year, end_year + 1):
-    df_year = base_df.copy()
-    df_year["time"] = df_year["hour"].apply(lambda d: d.replace(year=year))
-    df_year["year"] = year
-    df_year["system_capacity_kw"] = system_capacity_kw
-    all_years.append(df_year[["time", "year", "poa_Wm2", "ac_kWh", "system_capacity_kw"]])
+    all_years = []
+    for year in range(start_year, end_year + 1):
+        df_year = base_df.copy()
+        # 用 replace(year=year) 保留原来的时区信息
+        df_year["time"] = df_year["hour"].apply(lambda d: d.replace(year=year))
+        df_year["year"] = year
+        df_year["system_capacity_kw"] = system_capacity_kw
+        all_years.append(df_year[["time", "year", "poa_Wm2", "ac_kWh", "system_capacity_kw"]])
 
     return pd.concat(all_years, ignore_index=True)
 
@@ -86,7 +87,6 @@ for year in range(start_year, end_year + 1):
 # ---------------- Streamlit UI ----------------
 st.title("⚡ Load vs PV Generation (Green Button + PVWatts)")
 
-# Upload load data
 uploaded_file = st.file_uploader("Upload Alectra Green Button XML file", type=["xml"])
 
 with st.sidebar:
@@ -99,7 +99,6 @@ with st.sidebar:
     azimuth = st.slider("Panel azimuth (°)", 0, 360, 180)
 
 API_KEY = "NiW6JjfVhrZdFMiNwsQfNVuEveL67iy2Jmq9Gopz"
-
 
 if uploaded_file and st.button("Run Analysis"):
     try:
