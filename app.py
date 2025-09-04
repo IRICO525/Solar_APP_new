@@ -1,7 +1,7 @@
 import streamlit as st
 import xml.etree.ElementTree as ET
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime
 from io import BytesIO
 import requests
 
@@ -19,25 +19,20 @@ def parse_alectra_xml(uploaded_file):
     records = []
     for block in root.findall(".//atom:entry/atom:content/espi:IntervalBlock", ns):
         for reading in block.findall("espi:IntervalReading", ns):
-            start = reading.find("espi:timePeriod/espi:start", ns).text
-            duration = reading.find("espi:timePeriod/espi:duration", ns).text
-            value = reading.find("espi:value", ns).text
-
-            # Convert epoch → datetime UTC
-            ts_utc = pd.to_datetime(int(start), unit="s", utc=True)
+            start = int(reading.find("espi:timePeriod/espi:start", ns).text)
+            duration = int(reading.find("espi:timePeriod/espi:duration", ns).text)
+            value = float(reading.find("espi:value", ns).text)
 
             records.append({
-                "time": ts_utc,
-                "duration_sec": int(duration),
-                "load_Wh": float(value)
+                "epoch": start,
+                "duration_sec": duration,
+                "load_Wh": value
             })
 
     df = pd.DataFrame(records)
     df["load_kWh"] = df["load_Wh"] / 1000.0
-
-    # Convert to Toronto local time
-    df["time"] = df["time"].dt.tz_convert("America/Toronto")
-
+    # 额外转成人类可读的 Toronto 时间（仅展示用）
+    df["time"] = pd.to_datetime(df["epoch"], unit="s", utc=True).dt.tz_convert("America/Toronto")
     return df
 
 
@@ -65,9 +60,9 @@ def hourly_solar_data_multi_year(lat, lon, start_year, end_year,
     poa = data["poa"]  # W/m²
     ac = data["ac"]    # kWh
 
-    # ✅ 加入 tz 参数，避免夏令时报错
+    # 生成 Toronto 本地时间
     base_df = pd.DataFrame({
-        "hour": pd.date_range("2001-01-01", periods=8760, freq="H", tz="America/Toronto"),
+        "time": pd.date_range("2001-01-01", periods=8760, freq="H", tz="America/Toronto"),
         "poa_Wm2": poa,
         "ac_kWh": ac
     })
@@ -75,17 +70,18 @@ def hourly_solar_data_multi_year(lat, lon, start_year, end_year,
     all_years = []
     for year in range(start_year, end_year + 1):
         df_year = base_df.copy()
-        # 用 replace(year=year) 保留原来的时区信息
-        df_year["time"] = df_year["hour"].apply(lambda d: d.replace(year=year))
+        df_year["time"] = df_year["time"].apply(lambda d: d.replace(year=year))
+        # ✅ 转 epoch (UTC 秒)
+        df_year["epoch"] = df_year["time"].astype("int64") // 10**9
         df_year["year"] = year
         df_year["system_capacity_kw"] = system_capacity_kw
-        all_years.append(df_year[["time", "year", "poa_Wm2", "ac_kWh", "system_capacity_kw"]])
+        all_years.append(df_year[["epoch", "time", "year", "poa_Wm2", "ac_kWh", "system_capacity_kw"]])
 
     return pd.concat(all_years, ignore_index=True)
 
 
 # ---------------- Streamlit UI ----------------
-st.title("⚡ Load vs PV Generation (Green Button + PVWatts)")
+st.title("⚡ Load vs PV Generation (Epoch Alignment)")
 
 uploaded_file = st.file_uploader("Upload Alectra Green Button XML file", type=["xml"])
 
@@ -117,11 +113,8 @@ if uploaded_file and st.button("Run Analysis"):
                                              tilt=tilt, azimuth=azimuth,
                                              api_key=API_KEY)
 
-        # Resample PV data to 5 min
-        pv_df = pv_df.set_index("time").resample("5T").ffill().reset_index()
-
-        # Merge
-        merged = pd.merge(load_df, pv_df, on="time", how="inner")
+        # 合并用 epoch 对齐
+        merged = pd.merge(load_df, pv_df, on="epoch", how="inner")
 
         st.success("✅ Data merged successfully!")
 
